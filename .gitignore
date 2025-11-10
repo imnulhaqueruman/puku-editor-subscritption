@@ -1,0 +1,44 @@
+# Dependencies
+node_modules/
+package-lock.json
+yarn.lock
+pnpm-lock.yaml
+
+# Wrangler
+.wrangler/
+.dev.vars
+.mf/
+
+# Build output
+dist/
+*.log
+
+# Environment files
+.env
+.env.local
+.env.*.local
+.env.example
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# TypeScript
+*.tsbuildinfo
+
+# Testing
+coverage/
+.nyc_output/
+
+# Temporary files
+tmp/
+temp/
+
+.dev.vars
+wrangler.toml
