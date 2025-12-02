@@ -4,7 +4,6 @@ import {
   getUser,
   createUser,
   updateUser,
-  deleteUser,
 } from './database';
 import {
   createOpenRouterKey,
@@ -51,6 +50,7 @@ async function handleNewUser(
       total_limit: INITIAL_CREDITS,
       remaining_limit: INITIAL_CREDITS,
       usage_limit: KEY_DAILY_LIMIT,
+      blocked: false,
     });
 
     console.log(`New user created successfully: ${userClaims.uid}`);
@@ -66,40 +66,6 @@ async function handleNewUser(
     };
   } catch (error) {
     console.error('Error creating new user:', error);
-    throw error;
-  }
-}
-
-/**
- * Handles credit reset when user depletes all credits
- * @param env - Environment bindings
- * @param user - Existing user record
- * @param userClaims - JWT user claims
- * @returns API response with new key
- */
-async function handleCreditReset(
-  env: Env,
-  user: UserRecord,
-  userClaims: JWTPayload
-): Promise<APIResponse> {
-  console.log(`Resetting credits for user: ${user.user_id}`);
-
-  try {
-    // Delete old OpenRouter key if it exists
-    try {
-      await deleteOpenRouterKey(user.hash, env.PROVISIONING_API_KEY);
-      console.log(`Deleted old key for user: ${user.user_id}`);
-    } catch (error) {
-      console.warn(`Failed to delete old key (may not exist): ${error}`);
-    }
-
-    // Delete user record
-    await deleteUser(env.DB, user.user_id);
-
-    // Create fresh user
-    return await handleNewUser(env, userClaims);
-  } catch (error) {
-    console.error('Error resetting user credits:', error);
     throw error;
   }
 }
@@ -172,12 +138,38 @@ async function handleExistingUser(
   console.log(`Handling existing user: ${user.user_id}`);
 
   try {
+    // Check if user is blocked
+    if (user.blocked === true) {
+      console.log(`User ${user.user_id} is blocked due to exceeded total_limit`);
+      return {
+        success: false,
+        error: 'Your total_limit has been exceeded. Access blocked.',
+      };
+    }
+
     // Check if credits are depleted
     if (user.remaining_limit <= CREDIT_RESET_THRESHOLD) {
       console.log(
-        `User ${user.user_id} has depleted credits (${user.remaining_limit}), resetting...`
+        `User ${user.user_id} has depleted credits (${user.remaining_limit}), blocking user...`
       );
-      return await handleCreditReset(env, user, userClaims);
+
+      // Block the user instead of resetting
+      await updateUser(env.DB, user.user_id, {
+        blocked: true,
+      });
+
+      // Delete the OpenRouter key
+      try {
+        await deleteOpenRouterKey(user.hash, env.PROVISIONING_API_KEY);
+        console.log(`Deleted key for blocked user: ${user.user_id}`);
+      } catch (error) {
+        console.warn(`Failed to delete key for blocked user: ${error}`);
+      }
+
+      return {
+        success: false,
+        error: 'Your total_limit has been exceeded. Access blocked.',
+      };
     }
 
     // Get current key status from OpenRouter
@@ -238,7 +230,16 @@ async function handleExistingUser(
     // If key doesn't exist in OpenRouter anymore (404), recreate it
     if (error instanceof Error && error.message.includes('404')) {
       console.log('Key not found in OpenRouter, creating new key...');
-      return await rotateKey(env, user, 0);
+      const { key, remainingCredits } = await rotateKey(env, user, 0);
+      return {
+        success: true,
+        data: {
+          key,
+          remaining_credits: Math.max(0, remainingCredits),
+          total_credits: INITIAL_CREDITS,
+          daily_limit: KEY_DAILY_LIMIT,
+        },
+      };
     }
 
     throw error;

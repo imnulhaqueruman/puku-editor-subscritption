@@ -30,8 +30,8 @@ export async function createUser(
 ): Promise<void> {
   await db
     .prepare(
-      `INSERT INTO users (user_id, user_name, email, key, hash, total_limit, remaining_limit, usage_limit)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+      `INSERT INTO users (user_id, user_name, email, key, hash, total_limit, remaining_limit, usage_limit, blocked)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
     )
     .bind(
       user.user_id,
@@ -41,7 +41,8 @@ export async function createUser(
       user.hash,
       user.total_limit,
       user.remaining_limit,
-      user.usage_limit
+      user.usage_limit,
+      user.blocked
     )
     .run();
 }
@@ -60,6 +61,7 @@ export async function updateUser(
     hash?: string;
     remaining_limit?: number;
     usage_limit?: number;
+    blocked?: boolean;
   }
 ): Promise<void> {
   const fields: string[] = [];
@@ -80,6 +82,10 @@ export async function updateUser(
   if (updates.usage_limit !== undefined) {
     fields.push('usage_limit = ?');
     values.push(updates.usage_limit);
+  }
+  if (updates.blocked !== undefined) {
+    fields.push('blocked = ?');
+    values.push(updates.blocked);
   }
 
   fields.push('updated_at = CURRENT_TIMESTAMP');

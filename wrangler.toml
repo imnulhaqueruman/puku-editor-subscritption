@@ -1,0 +1,26 @@
+name = "puku-subscription"
+main = "src/index.ts"
+compatibility_date = "2024-01-01"
+node_compat = true
+
+# Uncomment and add your D1 database ID after creating it
+# Run: npx wrangler d1 create puku-subscription-db
+[[d1_databases]]
+binding = "DB"
+database_name = "puku-subscription-db"
+database_id = "69cc5a29-6b0c-457a-9281-60d901e52b19"
+
+[vars]
+ENVIRONMENT = "development"
+
+# Staging environment configuration
+[env.staging]
+name = "puku-subscription-staging"
+
+# [[env.staging.d1_databases]]
+# binding = "DB"
+# database_name = "puku-subscription-db-staging"
+# database_id = "your-staging-database-id-here"
+
+[env.staging.vars]
+ENVIRONMENT = "staging"

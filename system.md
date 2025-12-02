@@ -1,0 +1,787 @@
+# System Design: Puku Editor Subscription Service
+
+---
+
+## 1. Overview
+
+**Purpose:**
+A credit-based API key management system that provides users with managed OpenRouter API keys, tracking usage and automatically rotating keys to ensure uninterrupted service.
+
+**Core Concept:**
+Each user gets **10 credits total (HARD LIMIT)**. OpenRouter API keys are provisioned with **$1 daily limits** and automatically rotated as they're consumed, deducting from the user's total credits. When credits are depleted (**≤ 0.1**), users are **PERMANENTLY BLOCKED**.
+
+---
+
+## 2. High-Level Architecture
+
+```text
+╔═════════════════════════════════════════════════════════════════════╗
+║                         CLIENT APPLICATION                          ║
+║                                                                     ║
+║              POST /api/key                                          ║
+║              Authorization: Bearer <JWT_TOKEN>                      ║
+╚═══════════════════════════════╤═════════════════════════════════════╝
+                                │
+                                │ HTTPS Request
+                                │ (Secured by Cloudflare)
+                                │
+                                ▼
+╔═════════════════════════════════════════════════════════════════════╗
+║               CLOUDFLARE WORKERS (Edge Network)                     ║
+║                                                                     ║
+║  ┌─────────────────────────────────────────────────────────────┐    ║
+║  │                 1. AUTHENTICATION LAYER                     │    ║
+║  │                                                             │    ║
+║  │   • Validate JWT Token                                      │    ║
+║  │   • Verify Signature (JWT_SECRET_CLOUD)                     │    ║
+║  │   • Extract Claims: uid, email, username                    │    ║
+║  └──────────────────────────┬──────────────────────────────────┘    ║
+║                             │                                       ║
+║                             ▼                                       ║
+║  ┌─────────────────────────────────────────────────────────────┐    ║
+║  │                 2. BUSINESS LOGIC LAYER                     │    ║
+║  │                                                             │    ║
+║  │   ┌──────────────┐  ┌──────────────┐  ┌──────────────┐      │    ║
+║  │   │   NEW USER   │  │   EXISTING   │  │     KEY      │      │    ║
+║  │   │   HANDLER    │  │     USER     │  │   ROTATION   │      │    ║
+║  │   │              │  │   HANDLER    │  │    LOGIC     │      │    ║
+║  │   │ • Create DB  │  │ • Check      │  │ • Monitor    │      │    ║
+║  │   │   Record     │  │   Blocked    │  │   Usage      │      │    ║
+║  │   │ • Provision  │  │ • Check      │  │ • Delete Old │      │    ║
+║  │   │   API Key    │  │   Credits    │  │   Key        │      │    ║
+║  │   │ • Set 10     │  │ • Verify Key │  │ • Create New │      │    ║
+║  │   │   Credits    │  │ • Block User │  │   Key        │      │    ║
+║  │   └──────────────┘  └──────────────┘  └──────────────┘      │    ║
+║  └────┬──────────────────────┬──────────────────┬───────────────┘    ║
+║       │                      │                  │                    ║
+╚═══════┼══════════════════════┼══════════════════┼════════════════════╝
+        │                      │                  │
+        │                      │                  │
+        ▼                      ▼                  ▼
+┌──────────────────┐  ┌───────────────────┐  ┌────────────────────┐
+│  CLOUDFLARE D1   │  │  OPENROUTER API   │  │   OPENROUTER API   │
+│    DATABASE      │  │                   │  │                    │
+│                  │  │  GET /api/v1/     │  │  POST /api/v1/     │
+│ • User Records   │  │      keys/:hash   │  │       keys         │
+│ • API Keys       │  │                   │  │                    │
+│ • Credit Tracking│  │  • Check Key      │  │  DELETE /api/v1/   │
+│ • Block Status   │  │    Status         │  │         keys/:hash │
+│                  │  │  • Get Remaining  │  │                    │
+│ (SQLite Based)   │  │    Limit          │  │  • Create New Key  │
+│                  │  │                   │  │  • Delete Old Key  │
+└──────────────────┘  └───────────────────┘  └────────────────────┘
+```
+
+---
+
+## 3. Component Architecture
+
+### 3.1 Core Components
+
+#### A. Authentication Layer
+
+* **Responsibility:** JWT token validation
+* **Input:** `Authorization: Bearer <token>` header
+* **Output:** User claims (`uid`, `email`, `username`)
+* **Technology:** JWT library with HMAC signing
+* **Secret:** `JWT_SECRET_CLOUD` environment variable
+
+#### B. Business Logic Layer
+
+Three primary handlers:
+
+1. **New User Handler**
+
+   * Creates first-time user records
+   * Provisions initial OpenRouter API key
+   * Initializes credit balance (**10 credits**)
+   * Sets `blocked = false`
+
+2. **Existing User Handler**
+
+   * Checks if user is blocked
+   * Checks credit balance and usage
+   * Determines if key rotation is needed
+   * Updates credit tracking
+   * Blocks user if credits depleted
+
+3. **Key Rotation Service**
+
+   * Monitors OpenRouter key usage
+   * Rotates keys when threshold is hit
+   * Updates database atomically
+
+#### C. Data Access Layer
+
+* **Cloudflare D1 Database:** User state persistence
+* **OpenRouter API Client:** External API key management
+
+---
+
+## 4. Data Models
+
+### 4.1 Database Schema (Cloudflare D1)
+
+```sql
+CREATE TABLE users (
+  user_id TEXT PRIMARY KEY,                 -- JWT claim: uid
+  user_name TEXT NOT NULL,                  -- JWT claim: username
+  email TEXT NOT NULL,                      -- JWT claim: email
+  key TEXT NOT NULL,                        -- OpenRouter API key (sk-or-v1-...)
+  hash TEXT NOT NULL,                       -- OpenRouter key hash/ID
+  total_limit REAL NOT NULL,                -- Total credits (always 10)
+  remaining_limit REAL NOT NULL,            -- Credits remaining
+  usage_limit REAL NOT NULL,                -- Last known usage on current key
+  blocked BOOLEAN NOT NULL DEFAULT FALSE,   -- User blocked when credits depleted
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX idx_user_id ON users(user_id);
+```
+
+### 4.2 Data Flow States
+
+**User State Transitions**
+
+```text
+╔═══════════════════════════════════════════════════════════════════╗
+║                          NEW USER REQUEST                         ║
+╚═══════════════════════════════════════════════════════════════════╝
+                                 │
+                                 │ User doesn't exist in DB
+                                 │
+                                 ▼
+┌───────────────────────────────────────────────────────────────────┐
+│                         CREATE USER                               │
+│                                                                   │
+│  • Create OpenRouter API Key (limit: $1)                          │
+│  • Insert DB Record                                               │
+│  • Set total_limit = 10                                           │
+│  • Set remaining_limit = 10                                       │
+│  • Set usage_limit = 1                                            │
+│  • Set blocked = false                                            │
+└───────────────────────────┬───────────────────────────────────────┘
+                            │
+                            ▼
+╔═══════════════════════════════════════════════════════════════════╗
+║                       ACTIVE USER STATE                           ║
+║                    (remaining_limit > 0.1)                        ║
+╚═══════════════════════════════════════════════════════════════════╝
+                            │
+                            │ Every Request
+                            │
+                            ▼
+┌───────────────────────────────────────────────────────────────────┐
+│              CHECK OPENROUTER KEY STATUS                          │
+│                                                                   │
+│  GET /api/v1/keys/:hash                                           │
+│  Returns: limit_remaining (e.g., 0.6)                             │
+└───────────────┬───────────────────────────────────────────────────┘
+                │
+                │
+       ┌────────┴────────┐
+       │                 │
+       ▼                 ▼
+┌─────────────┐   ┌─────────────────┐
+│ KEEP KEY    │   │  ROTATE KEY     │
+│             │   │                 │
+│ remaining   │   │  remaining      │
+│   > 0.5     │   │   ≤ 0.5         │
+└──────┬──────┘   └────────┬────────┘
+       │                   │
+       │                   │ 1. Update credits
+       │                   │ 2. Delete old key
+       │                   │ 3. Create new key ($1 limit)
+       │                   │ 4. Update DB record
+       │                   │
+       │                   ▼
+       │          ┌─────────────────┐
+       │          │ NEW KEY ACTIVE  │
+       │          │ usage_limit = 1 │
+       │          └────────┬────────┘
+       │                   │
+       └───────────────────┘
+                   │
+                   ▼
+       ┌───────────────────────┐
+       │  UPDATE CREDITS       │
+       │                       │
+       │  consumed = old_usage │
+       │            - new_usage│
+       │                       │
+       │  remaining_limit -=   │
+       │            consumed   │
+       └───────────┬───────────┘
+                   │
+                   │
+          ┌────────┴─────────┐
+          │                  │
+          ▼                  ▼
+┌──────────────────┐  ┌────────────────────┐
+│  CONTINUE ACTIVE │  │   BLOCKED STATE    │
+│                  │  │                    │
+│ remaining > 0.1  │  │ remaining ≤ 0.1    │
+│                  │  │                    │
+│ Return to        │  │ SET blocked = true │
+│ Active State     │  │ DELETE API Key     │
+│                  │  │ Return Error:      │
+│                  │  │ "total_limit       │
+│                  │  │  exceeded"         │
+└──────────────────┘  └────────────────────┘
+```
+
+---
+
+## 5. API Design
+
+### 5.1 Endpoint Specification
+
+`POST /api/key`
+
+**Description:** Get or create API key for authenticated user
+
+**Headers:**
+
+* `Authorization: Bearer <JWT>`
+
+**Request Body:**
+
+* `None`
+
+**Response:**
+
+```json
+{
+  "key": "sk-or-v1-...",
+  "remaining_credits": 9.5,
+  "total_credits": 10,
+  "daily_limit": 1
+}
+```
+
+### 5.2 Error Responses
+
+```json
+{
+  "error": "Unauthorized"                                    
+}
+```
+
+`// 401: Invalid/missing JWT`
+
+```json
+{
+  "error": "Forbidden"
+}
+```
+
+`// 403: Token expired/missing auth header`
+
+```json
+{
+  "error": "Your total_limit has been exceeded. Access blocked."
+}
+```
+
+`// User exceeded 10 credits (blocked=true)`
+
+```json
+{
+  "error": "Service unavailable"
+}
+```
+
+`// 503: OpenRouter API failure`
+
+```json
+{
+  "error": "Internal server error"
+}
+```
+
+`// 500: Database/unexpected errors`
+
+---
+
+## 6. Sequence Diagrams
+
+### 6.1 New User Flow
+
+```text
+Client          Worker          D1 DB       OpenRouter API
+  │                │              │                │
+  │─────POST────→  │              │                │
+  │  /api/key      │              │                │
+  │  + JWT token   │              │                │
+  │                │              │                │
+  │                │──Validate────│                │
+  │                │    JWT       │                │
+  │                │              │                │
+  │                │──Query user──→                │
+  │                │  by user_id  │                │
+  │                │              │                │
+  │                │←──No record──│                │
+  │                │              │                │
+  │                │──────────────┼─Create key────→│
+  │                │              │  limit: 1      │
+  │                │              │                │
+  │                │←─────────────┼─Response──────│
+  │                │              │  {key, hash}   │
+  │                │              │                │
+  │                │──Insert user─→                │
+  │                │  total: 10   │                │
+  │                │  remaining:10│                │
+  │                │  usage: 1    │                │
+  │                │  blocked:false│               │
+  │                │              │                │
+  │                │←──Success────│                │
+  │                │              │                │
+  │←────200────────│              │                │
+  │  {key: "...",  │              │                │
+  │   remaining: 10}              │                │
+```
+
+### 6.2 Existing User Flow (Key Still Valid)
+
+```text
+Client          Worker          D1 DB       OpenRouter API
+  │                │              │                │
+  │─────POST────→  │              │                │
+  │  /api/key      │              │                │
+  │                │              │                │
+  │                │──Query user──→                │
+  │                │              │                │
+  │                │←──User data──│                │
+  │                │  remaining:9.5│               │
+  │                │  usage: 0.7  │                │
+  │                │  hash: "..." │                │
+  │                │              │                │
+  │                │──────────────┼─GET /keys/:hash→│
+  │                │              │                │
+  │                │←─────────────┼─Response──────│
+  │                │              │limit_remaining:│
+  │                │              │     0.6        │
+  │                │              │                │
+  │                │  [0.6 > 0.5 → Keep key]       │
+  │                │              │                │
+  │                │──Update user─→                │
+  │                │remaining=9.5- │                │
+  │                │  (0.7-0.6)   │                │
+  │                │= 9.4         │                │
+  │                │usage = 0.6   │                │
+  │                │              │                │
+  │←────200────────│              │                │
+  │  {key: "...",  │              │                │
+  │   remaining:9.4}              │                │
+```
+
+### 6.3 Existing User Flow (Key Rotation)
+
+```text
+Client          Worker          D1 DB       OpenRouter API
+  │                │              │                │
+  │─────POST────→  │              │                │
+  │  /api/key      │              │                │
+  │                │              │                │
+  │                │──Query user──→                │
+  │                │              │                │
+  │                │←──User data──│                │
+  │                │  remaining:8.5│               │
+  │                │  usage: 0.6  │                │
+  │                │  hash: "X"   │                │
+  │                │              │                │
+  │                │──────────────┼─GET /keys/:hash→│
+  │                │              │                │
+  │                │←─────────────┼─Response──────│
+  │                │              │limit_remaining:│
+  │                │              │     0.3        │
+  │                │              │                │
+  │                │  [0.3 ≤ 0.5 → Rotate key]     │
+  │                │              │                │
+  │                │──Update──────→                │
+  │                │remaining=8.5- │                │
+  │                │  (0.6-0.3)   │                │
+  │                │= 8.2         │                │
+  │                │              │                │
+  │                │──────────────┼─DELETE /keys/X→│
+  │                │              │                │
+  │                │←─────────────┼─{deleted:true}─│
+  │                │              │                │
+  │                │──────────────┼─POST /keys────→│
+  │                │              │  limit: 1      │
+  │                │              │                │
+  │                │←─────────────┼─{key:"Y",─────│
+  │                │              │  hash:"Y"}     │
+  │                │              │                │
+  │                │──Update user─→                │
+  │                │  key = "Y"   │                │
+  │                │  hash = "Y"  │                │
+  │                │  usage = 1   │                │
+  │                │              │                │
+  │←────200────────│              │                │
+  │  {key: "Y",    │              │                │
+  │   remaining:8.2}              │                │
+```
+
+---
+
+## 7. Business Logic Details
+
+### 7.1 Credit Calculation Formula
+
+```text
+// When checking existing key usage:
+consumed = usage_limit - limit_remaining
+remaining_limit = remaining_limit - consumed
+usage_limit = limit_remaining
+
+// Example:
+// Before: remaining_limit = 9.5, usage_limit = 0.7
+// After API check: limit_remaining = 0.4
+// Consumed: 0.7 - 0.4 = 0.3
+// New remaining: 9.5 - 0.3 = 9.2
+// New usage: 0.4
+```
+
+### 7.2 Decision Tree
+
+```text
+╔═════════════════════════════════════════════════════════════════╗
+║                    REQUEST ARRIVES                              ║
+║              POST /api/key + JWT Token                          ║
+╚═══════════════════════════════╤═════════════════════════════════╝
+                                │
+                                ▼
+                      ┌─────────────────────────┐
+                      │   VALIDATE JWT TOKEN    │
+                      │   (JWT_SECRET_CLOUD)    │
+                      └────────┬────────────────┘
+                               │
+                      ┌────────┴─────────┐
+                      │                  │
+                     Yes                No
+                      │                  │
+                      ▼                  ▼
+           ┌────────────────┐    ┌─────────────────┐
+           │ EXTRACT CLAIMS │    │ ❌ 401 ERROR    │
+           │ • uid          │    │ "Unauthorized"  │
+           │ • email        │    └─────────────────┘
+           │ • username     │
+           └────────┬───────┘
+                    │
+                    ▼
+           ┌─────────────────────┐
+           │ QUERY DATABASE      │
+           │ SELECT * FROM users │
+           │ WHERE user_id = uid │
+           └────────┬────────────┘
+                    │
+           ┌────────┴─────────┐
+           │                  │
+        EXISTS            NOT EXISTS
+           │                  │
+           ▼                  ▼
+    ┌────────────────┐  ┌──────────────────────┐
+    │ CHECK BLOCKED  │  │ 🆕 NEW USER FLOW     │
+    │ & CREDITS      │  │                      │
+    └────────┬───────┘  │ 1. Create API Key    │
+             │          │    (OpenRouter)      │
+    ┌────────┴────┐     │ 2. Insert DB Record  │
+    │             │     │    • total = 10      │
+    │             │     │    • remaining = 10  │
+blocked=true ≤ 0.1│     │    • usage = 1       │
+    │             │     │    • blocked = false │
+    │             │     │ 3. Return Key        │
+    │             │     └──────────────────────┘
+    │             │
+    ▼             ▼
+┌─────────────────────┐
+│ 🚫 BLOCK USER       │
+│                     │
+│ 1. Set blocked=true │
+│ 2. Delete API Key   │
+│ 3. Return Error:    │
+│    "total_limit     │
+│     exceeded"       │
+└─────────────────────┘
+  │
+  ▼
+  ┌─────────────────────────┐
+  │ GET KEY STATUS          │
+  │ from OpenRouter API     │
+  │ /api/v1/keys/:hash      │
+  └────────┬────────────────┘
+           │
+           │ Returns: limit_remaining
+           │
+  ┌────────┴───────────┐
+  │                    │
+  │                    │
+  ▼                    ▼
+  ┌─────────────┐  ┌──────────────────────┐
+  │ > 0.5       │  │ ≤ 0.5                │
+  │             │  │                      │
+  │ ✅ RETURN   │  │ 🔄 ROTATE KEY        │
+  │ EXISTING    │  │                      │
+  │ KEY         │  │ 1. Calculate         │
+  │             │  │    consumed credits  │
+  │ 1. Update   │  │ 2. Update remaining  │
+  │    credits  │  │    credits           │
+  │ 2. Update   │  │ 3. Delete old key    │
+  │    usage    │  │ 4. Create new key    │
+  │ 3. Return   │  │    (limit: $1)       │
+  │    existing │  │ 5. Update DB         │
+  │    key      │  │ 6. Return new key    │
+  └─────────────┘  └──────────────────────┘
+```
+
+---
+
+## 8. Security Architecture
+
+### 8.1 Authentication Flow
+
+1. Client sends JWT (signed by external auth service)
+2. Worker validates signature using `JWT_SECRET_CLOUD`
+3. Extract claims: `uid`, `email`, `username`
+4. Use `uid` as primary identifier
+
+### 8.2 Security Measures
+
+| Layer          | Protection       | Implementation                  |
+| -------------- | ---------------- | ------------------------------- |
+| Transport      | TLS/HTTPS        | Cloudflare enforced             |
+| Authentication | JWT validation   | HMAC SHA-256                    |
+| Authorization  | User-scoped data | Query by user_id from token     |
+| API Keys       | Secure storage   | D1 database (encrypted at rest) |
+| Secrets        | Environment vars | Cloudflare Workers secrets      |
+| Rate limiting  | Cloudflare       | Built-in DDoS protection        |
+
+### 8.3 Sensitive Data Handling
+
+* JWT Secret: Never logged, stored only in environment
+* API Keys: Stored in D1, returned only to authenticated owner
+* Provisioning Key: Server-side only, never exposed to clients
+
+---
+
+## 9. Error Handling & Edge Cases
+
+### 9.1 Error Scenarios
+
+| Scenario             | Detection                | Handling                                  |
+| -------------------- | ------------------------ | ----------------------------------------- |
+| JWT expired          | Token validation fails   | 401 + "Token expired"                     |
+| User already blocked | blocked = true           | Return error: "total_limit exceeded"      |
+| OpenRouter API down  | HTTP 5xx from OpenRouter | 503 + Retry logic                         |
+| D1 database error    | Query exception          | 500 + Log error                           |
+| Concurrent requests  | Race condition           | D1 transactions                           |
+| Credit exhaustion    | remaining_limit ≤ 0.1    | Block user (set blocked=true, delete key) |
+| Key creation fails   | OpenRouter returns error | 500 + Rollback DB changes                 |
+
+### 9.2 Edge Cases
+
+**Case 1: User depletes all credits**
+`remaining_limit = 0.05 (≤ 0.1)`
+→ Set `blocked = true` in database
+→ Delete OpenRouter API key
+→ Return error: `"Your total_limit has been exceeded. Access blocked."`
+→ User permanently blocked (no reset)
+
+**Case 2: OpenRouter key already deleted externally**
+`GET /keys/:hash` returns `404`
+→ Log warning
+→ Create new key
+→ Update database
+→ Return new key to user
+
+**Case 3: Exactly at rotation threshold**
+`limit_remaining = 0.5 (not ≤ 0.5)`
+→ Keep existing key
+→ Will rotate on next request when it drops below 0.5
+
+---
+
+## 10. Scalability Considerations
+
+### 10.1 Cloudflare Workers Advantages
+
+* Global edge deployment: Low latency worldwide
+* Auto-scaling: Handles traffic spikes automatically
+* No cold starts: Always warm
+* Cost-effective: Pay per request
+
+### 10.2 Database Optimization
+
+```sql
+-- Indexes for fast lookups
+CREATE INDEX idx_user_id ON users(user_id);
+
+-- Query pattern: Always by user_id (primary key)
+SELECT * FROM users WHERE user_id = ?;
+```
+
+### 10.3 API Rate Limiting
+
+**OpenRouter API:**
+
+* Provisioning API limits apply
+* Implement exponential backoff on failures
+* Cache user data for short periods (optional)
+
+**Client API:**
+
+* Cloudflare's built-in rate limiting
+* Consider implementing per-user limits if needed
+
+---
+
+## 11. Monitoring & Observability
+
+### 11.1 Key Metrics to Track
+
+**Request metrics**
+
+* Total requests per minute
+* Success rate (2xx responses)
+* Error rate by type (4xx, 5xx)
+* Average response time
+
+**Business metrics**
+
+* New users created per day
+* Key rotations per day
+* Average credits consumed per user
+* Users hitting credit limits
+* Total blocked users
+* Blocked users per day
+
+**System health**
+
+* OpenRouter API latency
+* OpenRouter API error rate
+* D1 query latency
+* D1 error rate
+
+### 11.2 Logging Strategy
+
+Log on key events:
+
+* ✓ New user created
+* ✓ Key rotation performed
+* ✓ User blocked (credits depleted)
+* ✗ OpenRouter API errors
+* ✗ JWT validation failures
+* ✗ Database errors
+* ✗ Blocked user access attempts
+
+---
+
+## 12. Deployment Architecture
+
+```text
+Development → Staging → Production
+     │            │          │
+     ├─ Local D1  ├─ D1 DB   ├─ D1 DB (prod)
+     ├─ Test keys ├─ Test OR ├─ Prod OpenRouter
+     └─ wrangler  └─ wrangler └─ wrangler deploy
+        dev           deploy       --env production
+```
+
+**Environment Configuration**
+
+```toml
+# wrangler.toml
+name = "puku-subscription"
+main = "src/index.ts"
+compatibility_date = "2024-01-01"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "puku-subscription-db"
+database_id = "<your-d1-id>"
+
+[vars]
+ENVIRONMENT = "production"
+```
+
+**Secrets (set via `wrangler secret put`)**
+
+* `JWT_SECRET_CLOUD`
+* `PROVISIONING_API_KEY`
+
+---
+
+## 13. Future Enhancements
+
+1. **Usage Analytics Dashboard**
+
+   * Track user consumption patterns
+   * Predict when users will exhaust credits
+
+2. **Credit Top-up System**
+
+   * Allow users to purchase additional credits
+   * Integrate payment gateway
+
+3. **Multiple Tier Plans**
+
+   * Basic: 10 credits
+   * Pro: 50 credits
+   * Enterprise: Unlimited
+
+4. **Webhook Notifications**
+
+   * Alert users when credits are low
+   * Notify on key rotation
+
+5. **Admin API**
+
+   * View all users
+   * Manually adjust credits
+   * Force key rotation
+
+---
+
+## 14. Credit Limit Policy
+
+**IMPORTANT: 10 Credits is a HARD LIMIT (Not Unlimited)**
+
+**Previous Behavior (REMOVED):**
+
+* ❌ Users got unlimited credits through auto-reset
+* ❌ When credits depleted, system deleted user and created fresh account with 10 new credits
+* ❌ This allowed unlimited usage in 10-credit batches
+
+**Current Behavior (IMPLEMENTED):**
+
+* ✅ Each user gets exactly **10 credits (ONE TIME)**
+* ✅ Credits deduct as API keys are consumed
+* ✅ When `remaining_limit ≤ 0.1`:
+
+  * • User is **PERMANENTLY BLOCKED** (`blocked = true`)
+  * • OpenRouter API key is **DELETED**
+  * • All future requests return error: `"Your total_limit has been exceeded. Access blocked."`
+* ✅ NO automatic resets
+* ✅ NO credit top-ups (unless manually implemented by admin)
+
+**User Lifecycle:**
+
+1. New User → 10 credits, `blocked = false`
+2. Using Service → Credits decrease (`10 → 9 → 8 ... → 0.1`)
+3. Credits Depleted (`≤ 0.1`) → `blocked = true`, API key deleted
+4. Future Requests → Permanent error message
+
+**Admin Manual Unblock (Future Enhancement):**
+
+To unblock a user, admin would need to:
+
+* Set `blocked = false`
+* Reset `remaining_limit` to desired value
+* Create new OpenRouter API key
+* Update `key` and `hash` in database
+
+---
+
+This Notion-ready document preserves your original information and diagrams while structuring it cleanly for documentation and review.

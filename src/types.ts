@@ -4,6 +4,7 @@ export interface Env {
   DB: D1Database;
   JWT_SECRET_CLOUD: string;
   PROVISIONING_API_KEY: string;
+  API_ACCESS_TOKEN: string;
   ENVIRONMENT?: string;
 }
 
@@ -23,6 +24,7 @@ export interface UserRecord {
   total_limit: number;
   remaining_limit: number;
   usage_limit: number;
+  blocked: boolean;
   created_at: string;
   updated_at: string;
 }

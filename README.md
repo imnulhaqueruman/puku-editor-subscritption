@@ -5,8 +5,8 @@ System Design: Puku Editor Subscription Service
   Purpose: A credit-based API key management system that provides users with managed OpenRouter API keys, tracking usage and automatically rotating keys
   to ensure uninterrupted service.
 
-  Core Concept: Each user gets 10 credits total. OpenRouter API keys are provisioned with $1 daily limits and automatically rotated as they're consumed,
-  deducting from the user's total credits.
+  Core Concept: Each user gets 10 credits total (HARD LIMIT). OpenRouter API keys are provisioned with $1 daily limits and automatically rotated as
+  they're consumed, deducting from the user's total credits. When credits are depleted (≤ 0.1), users are PERMANENTLY BLOCKED.
 
   ---
   2. High-Level Architecture
@@ -42,11 +42,11 @@ System Design: Puku Editor Subscription Service
   ║  │   │   HANDLER    │  │     USER     │  │   ROTATION   │     │  ║
   ║  │   │              │  │   HANDLER    │  │    LOGIC     │     │  ║
   ║  │   │ • Create DB  │  │ • Check      │  │ • Monitor    │     │  ║
-  ║  │   │   Record     │  │   Credits    │  │   Usage      │     │  ║
-  ║  │   │ • Provision  │  │ • Verify     │  │ • Delete Old │     │  ║
-  ║  │   │   API Key    │  │   Key Status │  │   Key        │     │  ║
-  ║  │   │ • Set 10     │  │ • Update     │  │ • Create New │     │  ║
-  ║  │   │   Credits    │  │   Usage      │  │   Key        │     │  ║
+  ║  │   │   Record     │  │   Blocked    │  │   Usage      │     │  ║
+  ║  │   │ • Provision  │  │ • Check      │  │ • Delete Old │     │  ║
+  ║  │   │   API Key    │  │   Credits    │  │   Key        │     │  ║
+  ║  │   │ • Set 10     │  │ • Verify Key │  │ • Create New │     │  ║
+  ║  │   │   Credits    │  │ • Block User │  │   Key        │     │  ║
   ║  │   └──────────────┘  └──────────────┘  └──────────────┘     │  ║
   ║  └────┬──────────────────────┬──────────────────┬──────────────┘  ║
   ║       │                      │                  │                  ║
@@ -61,7 +61,7 @@ System Design: Puku Editor Subscription Service
   │ • User Records   │  │      keys/:hash   │  │       keys         │
   │ • API Keys       │  │                   │  │                    │
   │ • Credit Tracking│  │  • Check Key      │  │  DELETE /api/v1/   │
-  │ • Usage History  │  │    Status         │  │         keys/:hash │
+  │ • Block Status   │  │    Status         │  │         keys/:hash │
   │                  │  │  • Get Remaining  │  │                    │
   │ (SQLite Based)   │  │    Limit          │  │  • Create New Key  │
   │                  │  │                   │  │  • Delete Old Key  │
@@ -87,11 +87,14 @@ System Design: Puku Editor Subscription Service
   1. New User Handler
     - Creates first-time user records
     - Provisions initial OpenRouter API key
-    - Initializes credit balance
+    - Initializes credit balance (10 credits)
+    - Sets blocked = false
   2. Existing User Handler
+    - Checks if user is blocked
     - Checks credit balance and usage
     - Determines if key rotation is needed
     - Updates credit tracking
+    - Blocks user if credits depleted
   3. Key Rotation Service
     - Monitors OpenRouter key usage
     - Rotates keys when threshold is hit
@@ -116,6 +119,7 @@ System Design: Puku Editor Subscription Service
     total_limit REAL NOT NULL,          -- Total credits (always 10)
     remaining_limit REAL NOT NULL,      -- Credits remaining
     usage_limit REAL NOT NULL,          -- Last known usage on current key
+    blocked BOOLEAN NOT NULL DEFAULT FALSE,  -- User blocked when credits depleted
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
   );
@@ -141,6 +145,7 @@ System Design: Puku Editor Subscription Service
   │  • Set total_limit = 10                                          │
   │  • Set remaining_limit = 10                                      │
   │  • Set usage_limit = 1                                           │
+  │  • Set blocked = false                                           │
   └───────────────────────────┬───────────────────────────────────────┘
                               │
                               ▼
@@ -199,14 +204,15 @@ System Design: Puku Editor Subscription Service
             │                  │
             ▼                  ▼
   ┌──────────────────┐  ┌────────────────────┐
-  │  CONTINUE ACTIVE │  │   DEPLETED STATE   │
+  │  CONTINUE ACTIVE │  │   BLOCKED STATE    │
   │                  │  │                    │
   │ remaining > 0.1  │  │ remaining ≤ 0.1    │
   │                  │  │                    │
-  │ Return to        │  │ DELETE USER RECORD │
-  │ Active State     │  │ Start Fresh:       │
-  │                  │  │ • New 10 credits   │
-  │                  │  │ • New API key      │
+  │ Return to        │  │ SET blocked = true │
+  │ Active State     │  │ DELETE API Key     │
+  │                  │  │ Return Error:      │
+  │                  │  │ "total_limit       │
+  │                  │  │  exceeded"         │
   └──────────────────┘  └────────────────────┘
 
   ---
@@ -230,11 +236,11 @@ System Design: Puku Editor Subscription Service
   5.2 Error Responses
 
   {
-    "error": "Unauthorized",           // 401: Invalid/missing JWT
-    "error": "Forbidden",              // 403: Token expired
-    "error": "Insufficient credits",   // 402: remaining_limit ≤ 0.1 and can't reset
-    "error": "Service unavailable",    // 503: OpenRouter API failure
-    "error": "Internal server error"   // 500: Database/unexpected errors
+    "error": "Unauthorized",                                    // 401: Invalid/missing JWT
+    "error": "Forbidden",                                       // 403: Token expired/missing auth header
+    "error": "Your total_limit has been exceeded. Access blocked.",  // User exceeded 10 credits (blocked=true)
+    "error": "Service unavailable",                            // 503: OpenRouter API failure
+    "error": "Internal server error"                           // 500: Database/unexpected errors
   }
 
   ---
@@ -266,6 +272,7 @@ System Design: Puku Editor Subscription Service
     │                │  total: 10   │                │
     │                │  remaining:10│                │
     │                │  usage: 1    │                │
+    │                │  blocked:false│               │
     │                │              │                │
     │                │←──Success────│                │
     │                │              │                │
@@ -406,26 +413,28 @@ System Design: Puku Editor Subscription Service
          │                  │
          ▼                  ▼
   ┌────────────────┐  ┌──────────────────────┐
-  │ CHECK CREDITS  │  │ 🆕 NEW USER FLOW     │
-  │ remaining_limit│  │                      │
+  │ CHECK BLOCKED  │  │ 🆕 NEW USER FLOW     │
+  │ & CREDITS      │  │                      │
   └────────┬───────┘  │ 1. Create API Key    │
            │          │    (OpenRouter)      │
   ┌────────┴────┐     │ 2. Insert DB Record  │
   │             │     │    • total = 10      │
   │             │     │    • remaining = 10  │
- > 0.1       ≤ 0.1    │    • usage = 1       │
+blocked=true ≤ 0.1    │    • usage = 1       │
+  │             │     │    • blocked = false │
   │             │     │ 3. Return Key        │
   │             │     └──────────────────────┘
   │             │
-  │             ▼
-  │    ┌────────────────────┐
-  │    │ 🔄 RESET USER      │
-  │    │                    │
-  │    │ 1. Delete Record   │
-  │    │ 2. Delete Old Key  │
-  │    │ 3. Start NEW USER  │
-  │    │    FLOW            │
-  │    └────────────────────┘
+  ▼             ▼
+┌─────────────────────┐
+│ 🚫 BLOCK USER       │
+│                     │
+│ 1. Set blocked=true │
+│ 2. Delete API Key   │
+│ 3. Return Error:    │
+│    "total_limit     │
+│     exceeded"       │
+└─────────────────────┘
   │
   ▼
   ┌─────────────────────────┐
@@ -488,22 +497,24 @@ System Design: Puku Editor Subscription Service
 
   9.1 Error Scenarios
 
-  | Scenario            | Detection                | Handling                       |
-  |---------------------|--------------------------|--------------------------------|
-  | JWT expired         | Token validation fails   | 401 + "Token expired"          |
-  | OpenRouter API down | HTTP 5xx from OpenRouter | 503 + Retry logic              |
-  | D1 database error   | Query exception          | 500 + Log error                |
-  | Concurrent requests | Race condition           | D1 transactions                |
-  | Credit exhaustion   | remaining_limit ≤ 0.1    | Reset user (delete + recreate) |
-  | Key creation fails  | OpenRouter returns error | 500 + Rollback DB changes      |
+  | Scenario            | Detection                | Handling                                  |
+  |---------------------|--------------------------|-------------------------------------------|
+  | JWT expired         | Token validation fails   | 401 + "Token expired"                     |
+  | User already blocked| blocked = true           | Return error: "total_limit exceeded"      |
+  | OpenRouter API down | HTTP 5xx from OpenRouter | 503 + Retry logic                         |
+  | D1 database error   | Query exception          | 500 + Log error                           |
+  | Concurrent requests | Race condition           | D1 transactions                           |
+  | Credit exhaustion   | remaining_limit ≤ 0.1    | Block user (set blocked=true, delete key) |
+  | Key creation fails  | OpenRouter returns error | 500 + Rollback DB changes                 |
 
   9.2 Edge Cases
 
   Case 1: User depletes all credits
   remaining_limit = 0.05 (≤ 0.1)
-  → Delete user record
-  → Start fresh with 10 credits
-  → Create new OpenRouter key
+  → Set blocked = true in database
+  → Delete OpenRouter API key
+  → Return error: "Your total_limit has been exceeded. Access blocked."
+  → User permanently blocked (no reset)
 
   Case 2: OpenRouter key already deleted externally
   GET /keys/:hash returns 404
@@ -562,6 +573,8 @@ System Design: Puku Editor Subscription Service
   - Key rotations per day
   - Average credits consumed per user
   - Users hitting credit limits
+  - Total blocked users
+  - Blocked users per day
 
   // System health
   - OpenRouter API latency
@@ -574,10 +587,11 @@ System Design: Puku Editor Subscription Service
   // Log on key events:
   ✓ New user created
   ✓ Key rotation performed
-  ✓ Credits depleted (reset triggered)
+  ✓ User blocked (credits depleted)
   ✗ OpenRouter API errors
   ✗ JWT validation failures
   ✗ Database errors
+  ✗ Blocked user access attempts
 
   ---
   12. Deployment Architecture
@@ -630,5 +644,38 @@ System Design: Puku Editor Subscription Service
     - Force key rotation
 
   ---
-  This system design provides a robust, scalable solution for managing OpenRouter API keys with automatic rotation and credit tracking, leveraging
-  Cloudflare's edge infrastructure for optimal performance. give me a readme with this
+  14. Credit Limit Policy
+
+  IMPORTANT: 10 Credits is a HARD LIMIT (Not Unlimited)
+
+  Previous Behavior (REMOVED):
+  ❌ Users got unlimited credits through auto-reset
+  ❌ When credits depleted, system deleted user and created fresh account with 10 new credits
+  ❌ This allowed unlimited usage in 10-credit batches
+
+  Current Behavior (IMPLEMENTED):
+  ✅ Each user gets exactly 10 credits (ONE TIME)
+  ✅ Credits deduct as API keys are consumed
+  ✅ When remaining_limit ≤ 0.1:
+     • User is PERMANENTLY BLOCKED (blocked = true)
+     • OpenRouter API key is DELETED
+     • All future requests return error: "Your total_limit has been exceeded. Access blocked."
+  ✅ NO automatic resets
+  ✅ NO credit top-ups (unless manually implemented by admin)
+
+  User Lifecycle:
+  1. New User → 10 credits, blocked = false
+  2. Using Service → Credits decrease (10 → 9 → 8 ... → 0.1)
+  3. Credits Depleted (≤ 0.1) → blocked = true, API key deleted
+  4. Future Requests → Permanent error message
+
+  Admin Manual Unblock (Future Enhancement):
+  To unblock a user, admin would need to:
+  - Set blocked = false
+  - Reset remaining_limit to desired value
+  - Create new OpenRouter API key
+  - Update key and hash in database
+
+  ---
+  This system design provides a robust, scalable solution for managing OpenRouter API keys with automatic rotation and credit tracking, enforcing
+  a strict 10-credit limit per user, leveraging Cloudflare's edge infrastructure for optimal performance.

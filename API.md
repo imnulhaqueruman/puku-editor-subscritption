@@ -54,7 +54,7 @@ Get or create an OpenRouter API key for the authenticated user.
 
 **Request:**
 ```bash
-curl -X POST https://your-worker.workers.dev/api/key \
+curl -X POST https://puku-subscription.poridhiclasses5.workers.dev/api/key \
   -H "Authorization: Bearer <JWT_TOKEN>" \
   -H "Content-Type: application/json"
 ```
